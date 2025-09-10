@@ -1,0 +1,171 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_log.h"
+
+// --- Pin definitions ---
+#define DIR_PIN GPIO_NUM_18
+#define PWM_PIN GPIO_NUM_19
+#define BTN_PIN GPIO_NUM_4
+#define LED_FWD GPIO_NUM_2
+#define LED_REV GPIO_NUM_21
+
+static const char *TAG = "DCMOTOR_RTOS";
+
+// --- Motor speed steps in percent ---
+const int motor_speeds[] = {0, 10, 20, 30};
+const int num_speeds = sizeof(motor_speeds)/sizeof(motor_speeds[0]);
+
+// --- FreeRTOS queues ---
+static QueueHandle_t btn_evt_queue;
+static QueueHandle_t motor_evt_queue;
+static QueueHandle_t led_evt_queue;
+
+// --- Motor state structure ---
+typedef struct {
+    int speed_index;
+    bool forward;
+} motor_state_t;
+
+static motor_state_t motor_state = {0,true};
+
+// --- PWM helpers ---
+static void set_motor_pwm(int duty){
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+static void set_led_fwd_pwm(int duty){
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
+
+static void set_led_rev_pwm(int duty){
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+}
+
+// --- Button ISR ---
+static void IRAM_ATTR btn_isr_handler(void* arg){
+    int evt = 1;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(btn_evt_queue, &evt, &xHigherPriorityTaskWoken);
+    if(xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+// --- Button Task ---
+void ButtonTask(void* arg){
+    ESP_LOGI(TAG, "ButtonTask started");
+    while(1){
+        int evt;
+        if(xQueueReceive(btn_evt_queue, &evt, portMAX_DELAY)){
+            // --- Debounce ---
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if(gpio_get_level(BTN_PIN) != 0) continue;
+
+            // --- Update motor state ---
+            if(motor_state.speed_index < num_speeds - 1){
+                motor_state.speed_index++;
+            } else {
+                motor_state.speed_index = 0;
+                motor_state.forward = !motor_state.forward;
+                gpio_set_level(DIR_PIN, motor_state.forward?1:0);
+            }
+
+            // --- Send state to MotorTask and LEDTask ---
+            xQueueSend(motor_evt_queue, &motor_state, portMAX_DELAY);
+            xQueueSend(led_evt_queue, &motor_state, portMAX_DELAY);
+
+            // --- Log button click ---
+            ESP_LOGI(TAG, "Button Clicked: speed_index=%d, direction=%s",
+                     motor_state.speed_index,
+                     motor_state.forward?"Forward":"Reverse");
+        }
+    }
+}
+
+// --- Motor Task ---
+void MotorTask(void* arg){
+    ESP_LOGI(TAG, "MotorTask started");
+    motor_state_t state;
+    while(1){
+        if(xQueueReceive(motor_evt_queue, &state, portMAX_DELAY)){
+            int duty = motor_speeds[state.speed_index] * 1023 / 100;
+            set_motor_pwm(duty);
+        }
+    }
+}
+
+// --- LED Task ---
+void LEDTask(void* arg){
+    ESP_LOGI(TAG, "LEDTask started");
+    motor_state_t state;
+    while(1){
+        if(xQueueReceive(led_evt_queue, &state, portMAX_DELAY)){
+            int duty = motor_speeds[state.speed_index] * 1023 / 100;
+            if(state.forward){
+                set_led_fwd_pwm(duty);
+                set_led_rev_pwm(0);
+            } else {
+                set_led_fwd_pwm(0);
+                set_led_rev_pwm(duty);
+            }
+        }
+    }
+}
+
+// --- Main application ---
+void app_main(void){
+    // --- Configure DIR pin ---
+    gpio_config_t io_conf_dir = {
+        .pin_bit_mask = (1ULL<<DIR_PIN),
+        .mode = GPIO_MODE_OUTPUT
+    };
+    gpio_config(&io_conf_dir);
+    gpio_set_level(DIR_PIN,1);
+
+    // --- Configure button pin ---
+    gpio_config_t io_conf_btn = {
+        .pin_bit_mask = (1ULL<<BTN_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_NEGEDGE
+    };
+    gpio_config(&io_conf_btn);
+
+    // --- Configure LEDs and motor PWM ---
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 1000,
+        .clk_cfg = LEDC_USE_APB_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    ledc_channel_config_t ledc_motor = {PWM_PIN, LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_TIMER_0, 0, 0};
+    ledc_channel_config(&ledc_motor);
+
+    ledc_channel_config_t ledc_led_fwd = {LED_FWD, LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, LEDC_TIMER_0, 0, 0};
+    ledc_channel_config(&ledc_led_fwd);
+
+    ledc_channel_config_t ledc_led_rev = {LED_REV, LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, LEDC_TIMER_0, 0, 0};
+    ledc_channel_config(&ledc_led_rev);
+
+    // --- Create queues and install ISR ---
+    btn_evt_queue = xQueueCreate(10,sizeof(int));
+    motor_evt_queue = xQueueCreate(10,sizeof(motor_state_t));
+    led_evt_queue = xQueueCreate(10,sizeof(motor_state_t));
+
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BTN_PIN, btn_isr_handler,NULL);
+
+    // --- Create tasks ---
+    xTaskCreate(ButtonTask,"ButtonTask",2048,NULL,10,NULL);
+    xTaskCreate(MotorTask,"MotorTask",2048,NULL,9,NULL);
+    xTaskCreate(LEDTask,"LEDTask",2048,NULL,8,NULL);
+
+    ESP_LOGI(TAG, "RTOS Motor Control Initialized");
+}
