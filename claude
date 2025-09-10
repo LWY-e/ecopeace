@@ -1,0 +1,298 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_log.h"
+
+// --- Pin definitions ---
+#define DIR_PIN GPIO_NUM_18
+#define PWM_PIN GPIO_NUM_19
+#define BTN_PIN GPIO_NUM_4
+#define LED_FWD GPIO_NUM_2
+#define LED_REV GPIO_NUM_21
+
+static const char *TAG = "DCMOTOR_RTOS";
+
+// --- Motor speed steps in percent ---
+const int motor_speeds[] = {0, 10, 20, 30};
+const int num_speeds = sizeof(motor_speeds)/sizeof(motor_speeds[0]);
+
+// --- FreeRTOS queues ---
+static QueueHandle_t btn_evt_queue;
+static QueueHandle_t motor_evt_queue;
+static QueueHandle_t led_evt_queue;
+
+// --- Motor state structure ---
+typedef struct {
+    int speed_index;
+    bool forward;
+} motor_state_t;
+
+static motor_state_t motor_state = {0, true};
+
+// --- Debounce variables ---
+static volatile uint32_t last_button_time = 0;
+static const uint32_t DEBOUNCE_TIME_MS = 500;  // 500ms debounce for motor noise immunity
+
+// --- PWM helpers with error checking ---
+static void set_motor_pwm(int duty){
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+}
+
+static void set_led_fwd_pwm(int duty){
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1));
+}
+
+static void set_led_rev_pwm(int duty){
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2));
+}
+
+// --- Enhanced Button ISR with hardware debouncing ---
+static void IRAM_ATTR btn_isr_handler(void* arg){
+    uint32_t current_time = xTaskGetTickCountFromISR() * portTICK_PERIOD_MS;
+    
+    // Hardware debouncing - ignore if too soon after last press
+    if (current_time - last_button_time < DEBOUNCE_TIME_MS) {
+        return;
+    }
+    
+    // Double check button state to avoid noise
+    if (gpio_get_level(BTN_PIN) != 0) {
+        return;
+    }
+    
+    last_button_time = current_time;
+    
+    int evt = 1;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(btn_evt_queue, &evt, &xHigherPriorityTaskWoken);
+    if(xHigherPriorityTaskWoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+// --- Button Task with enhanced debouncing ---
+void ButtonTask(void* arg){
+    ESP_LOGI(TAG, "ButtonTask started");
+    while(1){
+        int evt;
+        if(xQueueReceive(btn_evt_queue, &evt, portMAX_DELAY)){
+            
+            // Software debouncing - additional verification
+            vTaskDelay(pdMS_TO_TICKS(50));
+            
+            // Verify button is still pressed after delay
+            if(gpio_get_level(BTN_PIN) != 0) {
+                ESP_LOGW(TAG, "Button bounce detected - ignoring");
+                continue;
+            }
+            
+            // Wait for button release to prevent multiple triggers
+            int timeout_count = 0;
+            while(gpio_get_level(BTN_PIN) == 0 && timeout_count < 100) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                timeout_count++;
+            }
+            
+            if(timeout_count >= 100) {
+                ESP_LOGW(TAG, "Button stuck - ignoring");
+                continue;
+            }
+
+            // --- Update motor state ---
+            if(motor_state.speed_index < num_speeds - 1){
+                motor_state.speed_index++;
+            } else {
+                motor_state.speed_index = 0;
+                motor_state.forward = !motor_state.forward;
+                gpio_set_level(DIR_PIN, motor_state.forward ? 1 : 0);
+                ESP_LOGI(TAG, "Direction changed to: %s", motor_state.forward ? "Forward" : "Reverse");
+            }
+
+            // --- Send state to MotorTask and LEDTask ---
+            motor_state_t motor_copy = motor_state;
+            motor_state_t led_copy = motor_state;
+            
+            if(xQueueSend(motor_evt_queue, &motor_copy, pdMS_TO_TICKS(100)) != pdTRUE) {
+                ESP_LOGW(TAG, "Failed to send to motor queue");
+            }
+            
+            if(xQueueSend(led_evt_queue, &led_copy, pdMS_TO_TICKS(100)) != pdTRUE) {
+                ESP_LOGW(TAG, "Failed to send to LED queue");
+            }
+
+            // --- Log button click ---
+            ESP_LOGI(TAG, "Button Clicked: speed=%d%%, direction=%s",
+                     motor_speeds[motor_state.speed_index],
+                     motor_state.forward ? "Forward" : "Reverse");
+                     
+            // Additional delay to prevent rapid state changes
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
+// --- Motor Task with gradual PWM changes ---
+void MotorTask(void* arg){
+    ESP_LOGI(TAG, "MotorTask started");
+    motor_state_t state;
+    int current_duty = 0;
+    
+    while(1){
+        if(xQueueReceive(motor_evt_queue, &state, portMAX_DELAY)){
+            int target_duty = motor_speeds[state.speed_index] * 1023 / 100;
+            
+            ESP_LOGI(TAG, "Motor: Target speed=%d%%, PWM duty=%d", 
+                motor_speeds[state.speed_index], target_duty);
+            
+            // Gradual PWM change to reduce electrical noise
+            while(current_duty != target_duty) {
+                if(current_duty < target_duty) {
+                    current_duty += (target_duty > current_duty + 50) ? 50 : (target_duty - current_duty);
+                } else {
+                    current_duty -= (current_duty > target_duty + 50) ? 50 : (current_duty - target_duty);
+                }
+                
+                set_motor_pwm(current_duty);
+                vTaskDelay(pdMS_TO_TICKS(10)); // Small delay for gradual change
+            }
+            
+            ESP_LOGI(TAG, "Motor PWM set to: %d", current_duty);
+        }
+    }
+}
+
+// --- LED Task ---
+void LEDTask(void* arg){
+    ESP_LOGI(TAG, "LEDTask started");
+    motor_state_t state;
+    
+    while(1){
+        if(xQueueReceive(led_evt_queue, &state, portMAX_DELAY)){
+            int duty = motor_speeds[state.speed_index] * 1023 / 100;
+            
+            if(state.forward){
+                set_led_fwd_pwm(duty);
+                set_led_rev_pwm(0);
+                ESP_LOGI(TAG, "Forward LED: %d%% (duty=%d)", motor_speeds[state.speed_index], duty);
+            } else {
+                set_led_fwd_pwm(0);
+                set_led_rev_pwm(duty);
+                ESP_LOGI(TAG, "Reverse LED: %d%% (duty=%d)", motor_speeds[state.speed_index], duty);
+            }
+        }
+    }
+}
+
+// --- Main application ---
+void app_main(void){
+    ESP_LOGI(TAG, "Starting Motor Control System...");
+    
+    // --- Configure DIR pin ---
+    gpio_config_t io_conf_dir = {
+        .pin_bit_mask = (1ULL << DIR_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf_dir));
+    gpio_set_level(DIR_PIN, 1);
+    ESP_LOGI(TAG, "Direction pin configured");
+
+    // --- Configure button pin with enhanced noise immunity ---
+    gpio_config_t io_conf_btn = {
+        .pin_bit_mask = (1ULL << BTN_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf_btn));
+    ESP_LOGI(TAG, "Button pin configured with pull-up");
+
+    // --- Configure LEDs and motor PWM with improved settings ---
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 1000,  // 1kHz PWM frequency
+        .clk_cfg = LEDC_AUTO_CLK  // Better for noise immunity
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+    ESP_LOGI(TAG, "LEDC timer configured");
+
+    // Motor PWM channel
+    ledc_channel_config_t ledc_motor = {
+        .gpio_num = PWM_PIN,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_motor));
+
+    // Forward LED PWM channel
+    ledc_channel_config_t ledc_led_fwd = {
+        .gpio_num = LED_FWD,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_led_fwd));
+
+    // Reverse LED PWM channel
+    ledc_channel_config_t ledc_led_rev = {
+        .gpio_num = LED_REV,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_2,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_led_rev));
+    ESP_LOGI(TAG, "All PWM channels configured");
+
+    // --- Create queues ---
+    btn_evt_queue = xQueueCreate(5, sizeof(int));          // Smaller queue to prevent overflow
+    motor_evt_queue = xQueueCreate(5, sizeof(motor_state_t));
+    led_evt_queue = xQueueCreate(5, sizeof(motor_state_t));
+
+    if(btn_evt_queue == NULL || motor_evt_queue == NULL || led_evt_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create queues");
+        return;
+    }
+    ESP_LOGI(TAG, "Queues created");
+
+    // --- Install ISR service ---
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BTN_PIN, btn_isr_handler, NULL));
+    ESP_LOGI(TAG, "ISR service installed");
+
+    // --- Create tasks ---
+    if(xTaskCreate(ButtonTask, "ButtonTask", 3072, NULL, 10, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create ButtonTask");
+        return;
+    }
+    
+    if(xTaskCreate(MotorTask, "MotorTask", 2048, NULL, 9, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create MotorTask");
+        return;
+    }
+    
+    if(xTaskCreate(LEDTask, "LEDTask", 2048, NULL, 8, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create LEDTask");
+        return;
+    }
+
+    ESP_LOGI(TAG, "All tasks created successfully");
+    ESP_LOGI(TAG, "RTOS Motor Control Initialized");
+    ESP_LOGI(TAG, "System ready - Press button to control motor");
+}
